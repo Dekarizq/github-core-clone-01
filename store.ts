@@ -21,7 +21,7 @@ export interface Comment { id: number; body: string; user: string; created_at: s
 export interface Issue {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; comments: Comment[]; seq: number; created_at: string; updated_at: string;
-  _json: string | null;
+  _json: string | null; _jsonLen: number;
 }
 export interface Pull {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
@@ -40,7 +40,7 @@ export interface Repo {
   nextNumber: number; // shared issue/PR counter
   nextCommentId: number;
   packVersion: number; // bumped on any ref/object change; invalidates pack cache
-  _json: string | null;
+  _json: string | null; _jsonLen: number;
 }
 
 export class Store {
@@ -63,7 +63,7 @@ export class Store {
       seq: this.repoOrder.length, created_at: isoOf(EPOCH + id),
       objects: new Map(), refs: new Map(), labels: new Map(),
       issues: new Map(), pulls: new Map(), nextNumber: 1, nextCommentId: 1,
-      packVersion: 0, _json: null,
+      packVersion: 0, _json: null, _jsonLen: 0,
     };
     this.repos.set(this.key(VIEWER.login, name), repo);
     this.repoOrder.push(repo);
@@ -210,7 +210,7 @@ export class Store {
     const created = isoOf(EPOCH + 100000 + id);
     const issue: Issue = {
       id, number, title, body: body ?? '', state: 'open', labels, comments: [],
-      seq: number, created_at: created, updated_at: created, _json: null,
+      seq: number, created_at: created, updated_at: created, _json: null, _jsonLen: 0,
     };
     repo.issues.set(number, issue);
     return issue;

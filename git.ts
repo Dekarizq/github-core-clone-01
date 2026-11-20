@@ -372,8 +372,9 @@ export function planFetch(
       else { dist.set(w, 0); }
     }
     const commitAt = new Map<string, number>();
-    while (queue.length) {
-      const cur = queue.shift()!;
+    let qi = 0;
+    while (qi < queue.length) {
+      const cur = queue[qi++];
       const d = dist.get(cur)!;
       const o = store.get(cur);
       if (!o) continue;
@@ -401,8 +402,9 @@ export function planFetch(
       keep.add(oid);
       if (o.type === 'commit') {
         if (commitAt.has(oid)) {
-          addClosure(parseCommit(o.data).tree);
-          for (const p of parseCommit(o.data).parents) if (commitAt.has(p)) addClosure(p);
+          const c = parseCommit(o.data);
+          addClosure(c.tree);
+          for (const p of c.parents) if (commitAt.has(p)) addClosure(p);
         }
       } else if (o.type === 'tag') addClosure(parseTag(o.data).object);
       else if (o.type === 'tree') for (const e of parseTree(o.data)) addClosure(e.oid);

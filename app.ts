@@ -17,7 +17,10 @@ import {
 } from './store.ts';
 
 // ---------------------------------------------------------------- helpers
-function reqId(): string { return `req_${(Math.random() * 0xffffffff).toString(16).padStart(8, '0')}`; }
+// Deterministic cheap request ids (a counter, not Math.random — faster and
+// reproducible across runs).
+let reqSeq = 0;
+function reqId(): string { reqSeq += 1; return `req_${reqSeq.toString(16).padStart(8, '0')}`; }
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -36,12 +39,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra?: Re
   });
   res.end(payload);
 }
-/** Send an already-serialized JSON body without re-stringifying (hot paths). */
-function sendRawJson(res: ServerResponse, status: number, payload: string, extra?: Record<string, string>): void {
+/** Send an already-serialized JSON body without re-stringifying (hot paths). `len` is the
+ * precomputed byte length of a cached payload (ASCII JSON: byte length == string length
+ * is NOT assumed — callers pass the cached Buffer.byteLength). */
+function sendRawJson(res: ServerResponse, status: number, payload: string, extra?: Record<string, string>, len?: number): void {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'X-GitHub-Request-Id': reqId(),
-    'Content-Length': Buffer.byteLength(payload),
+    'Content-Length': len ?? Buffer.byteLength(payload),
     ...(extra ?? {}),
   });
   res.end(payload);
@@ -81,6 +86,7 @@ function repoJson(repo: Repo): string {
     open_issues_count: [...repo.issues.values()].filter((i) => i.state === 'open').length,
   });
   repo._json = s;
+  repo._jsonLen = Buffer.byteLength(s);
   return s;
 }
 function issueJson(repo: Repo, issue: Issue): string {
@@ -96,6 +102,7 @@ function issueJson(repo: Repo, issue: Issue): string {
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
   });
   issue._json = s;
+  issue._jsonLen = Buffer.byteLength(s);
   return s;
 }
 function pullJson(store: Store, repo: Repo, pr: Pull): string {
@@ -196,19 +203,19 @@ function readLines(buf: Buffer): { lines: Array<{ kind: 'data' | 'flush' | 'deli
 
 // Pack cache: identical fetch requests (the clone workload issues 50 of
 // them) reuse one built pack until the repo changes (packVersion bump).
-function packFor(store: Store, repo: Repo, wants: Set<string>, haves: Set<string>, shallowBounds: Set<string>, depth: number | undefined): Buffer {
-  const key = `${repo.id}:${repo.packVersion}:${[...wants].sort().join(',')}:${[...haves].sort().join(',')}:${[...shallowBounds].sort().join(',')}:${depth ?? ''}`;
+// The fetch plan is computed ONCE per upload-pack request and shared
+// between the shallow-info section and the pack build (it used to be
+// computed twice — once for shallow, once for the pack).
+function packFromPlan(store: Store, repo: Repo, plan: { send: Set<string> }, key: string): Buffer {
   const hit = store.packCache.get(key);
   if (hit) return hit;
-  const { send } = planFetch(repo.objects, [...wants], [...haves], [...shallowBounds], depth ?? null);
-  const pack = writePack([...send].map((oid) => repo.objects.get(oid)!).filter(Boolean));
+  const pack = writePack([...plan.send].map((oid) => repo.objects.get(oid)!).filter(Boolean));
   if (store.packCache.size > 64) store.packCache.clear();
   store.packCache.set(key, pack);
   return pack;
 }
-function shallowOf(store: Store, repo: Repo, wants: Set<string>, haves: Set<string>, shallowBounds: Set<string>, depth: number | undefined): { shallow: string[]; unshallow: string[] } {
-  const { shallow, unshallow } = planFetch(repo.objects, [...wants], [...haves], [...shallowBounds], depth ?? null);
-  return { shallow, unshallow };
+function planKey(repo: Repo, wants: Set<string>, haves: Set<string>, shallowBounds: Set<string>, depth: number | undefined): string {
+  return `${repo.id}:${repo.packVersion}:${[...wants].sort().join(',')}:${[...haves].sort().join(',')}:${[...shallowBounds].sort().join(',')}:${depth ?? ''}`;
 }
 
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, store: Store, repo: Repo): Promise<void> {
@@ -246,11 +253,12 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, store
     }
     if (command === 'ls-refs') {
       // One line per ref; annotated tags carry the peel on their own line.
+      const allRefs = refsList(repo);
       const peelOf = new Map<string, string>();
-      for (const r of refsList(repo)) {
+      for (const r of allRefs) {
         if (r.name.endsWith('^{}')) peelOf.set(r.name.slice(0, -3), r.oid);
       }
-      const refs = refsList(repo).filter((r) => !r.name.endsWith('^{}'));
+      const refs = allRefs.filter((r) => !r.name.endsWith('^{}'));
       const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
       const headTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
       if (keep('HEAD')) {
@@ -272,8 +280,9 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, store
     // fetch: response sections are `acknowledgments`, `shallow-info`,
     // `packfile` (each header line ends with \n, sections end with flush);
     // the pack itself travels as sideband band-1 packets.
-    const { shallow, unshallow } = shallowOf(store, repo, wants, haves, shallowBounds, depth);
-    const pack = packFor(store, repo, wants, haves, shallowBounds, depth);
+    const plan = planFetch(repo.objects, [...wants], [...haves], [...shallowBounds], depth ?? null);
+    const { shallow, unshallow } = plan;
+    const pack = packFromPlan(store, repo, plan, planKey(repo, wants, haves, shallowBounds, depth));
     if (haves.size > 0) {
       res.write(pkt('acknowledgments\n'));
       res.write(pkt('NAK\n'));
@@ -311,8 +320,9 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, store
     else if (s.startsWith('deepen ')) depth = parseInt(s.slice(7), 10);
     else if (s === 'done') break;
   }
-  const { shallow, unshallow } = shallowOf(store, repo, wants, haves, shallowBounds, depth);
-  const pack = packFor(store, repo, wants, haves, shallowBounds, depth);
+  const plan = planFetch(repo.objects, [...wants], [...haves], [...shallowBounds], depth ?? null);
+  const { shallow, unshallow } = plan;
+  const pack = packFromPlan(store, repo, plan, planKey(repo, wants, haves, shallowBounds, depth));
   for (const s of shallow) res.write(pkt(`shallow ${s}`));
   for (const s of unshallow) res.write(pkt(`unshallow ${s}`));
   // v0 pack: when the client asked for side-band-64k the pack is wrapped in
@@ -350,11 +360,13 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, stor
   }
   const packData = body.subarray(offset);
   // Parse and store pack objects (all of them, even if a ref update is rejected).
-  let packObjects: GitObj[] = [];
+  // readPack's map is already keyed by oid — store directly, no re-hashing.
   if (packData.length > 12) {
-    try { packObjects = [...readPack(packData).objects.values()]; } catch { packObjects = []; }
+    try {
+      const parsed = readPack(packData, (oid) => repo.objects.get(oid));
+      for (const [oid, o] of parsed.objects) repo.objects.set(oid, o);
+    } catch { /* a bad pack stores nothing; the ref report below still answers */ }
   }
-  for (const o of packObjects) repo.objects.set(hashObject(o.type, o.data), o);
   const report: string[] = [];
   for (const cmd of commands) {
     const current = repo.refs.get(cmd.ref) ?? ZERO_OID;
@@ -370,10 +382,17 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, stor
       if (current !== cmd.oldOid) reason = 'non-fast-forward';
       else if (cmd.oldOid === cmd.newOid) ok = true;
       else {
-        const oldCommit = store.peelToCommit(repo, cmd.oldOid);
-        const newCommit = store.peelToCommit(repo, cmd.newOid);
-        if (oldCommit && newCommit && isAncestor(repo.objects, oldCommit, newCommit)) { repo.refs.set(cmd.ref, cmd.newOid); ok = true; }
-        else reason = 'non-fast-forward';
+        // Fast path (the push workload's case): the new commit's first parent
+        // IS the old tip — no need to walk the whole ancestor chain.
+        const newObj = repo.objects.get(cmd.newOid);
+        const newParents = newObj?.type === 'commit' ? parseCommit(newObj.data).parents : [];
+        if (newParents.includes(cmd.oldOid)) { repo.refs.set(cmd.ref, cmd.newOid); ok = true; }
+        else {
+          const oldCommit = store.peelToCommit(repo, cmd.oldOid);
+          const newCommit = store.peelToCommit(repo, cmd.newOid);
+          if (oldCommit && newCommit && isAncestor(repo.objects, oldCommit, newCommit)) { repo.refs.set(cmd.ref, cmd.newOid); ok = true; }
+          else reason = 'non-fast-forward';
+        }
       }
     }
     if (ok) report.push(`ok ${cmd.ref}`);
@@ -394,9 +413,12 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, stor
 }
 
 // ---------------------------------------------------------------- REST helpers
+/** Shared empty query params (never mutated — only .get() is used on it). */
+const EMPTY_PARAMS = new URLSearchParams();
 function parseQuery(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  return { pathname: url.pathname, query: url.searchParams };
+  const raw = req.url ?? '/';
+  const qi = raw.indexOf('?');
+  return { pathname: qi < 0 ? raw : raw.slice(0, qi), query: qi < 0 ? EMPTY_PARAMS : new URLSearchParams(raw.slice(qi + 1)) };
 }
 function pageParams(q: URLSearchParams): { page: number; perPage: number } {
   const perPage = Math.max(1, Math.min(100, Number(q.get('per_page') ?? 30) || 30));
@@ -472,7 +494,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, store: Stor
   // GET /user/repos
   if (rest.length === 2 && rest[0] === 'user' && rest[1] === 'repos' && method === 'GET') {
     const { page, link } = paginate(store.repoOrder, query, absUrl(req, '/api/v3/user/repos'));
-    sendRawJson(res, 200, `[${page.map((r) => repoJson(r)).join(',')}]`, { Link: link });
+    const items = page.map((r) => repoJson(r));
+    sendRawJson(res, 200, `[${items.join(',')}]`, { Link: link }, 2 + items.reduce((a, s, i) => a + (page[i] as Repo)._jsonLen, 0) + Math.max(0, items.length - 1));
     return;
   }
   // /repos/{owner}/{repo}...
@@ -483,7 +506,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, store: Stor
     if (!repo) { notFound(res); return; }
     // GET/DELETE/PATCH /repos/{o}/{r}
     if (tail.length === 0) {
-      if (method === 'GET') { sendRawJson(res, 200, repoJson(repo)); return; }
+      if (method === 'GET') { const j = repoJson(repo); sendRawJson(res, 200, j, undefined, repo._jsonLen); return; }
       if (method === 'DELETE') { store.deleteRepo(repo); res.writeHead(204, { 'X-GitHub-Request-Id': reqId() }); res.end(); return; }
       if (method === 'PATCH') {
         const b = await readBodyJson();
@@ -639,7 +662,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, store: Stor
         const labels = Array.isArray(b.value.labels) ? b.value.labels.map(String) : [];
         const created = store.createIssue(repo, title, String(b.value.body ?? ''), labels);
         if ('error' in created) { unprocessable(res, created.error); return; }
-        sendRawJson(res, 201, issueJson(repo, created));
+        const j = issueJson(repo, created);
+        sendRawJson(res, 201, j, undefined, created._jsonLen);
         return;
       }
       // GET /issues
@@ -651,14 +675,15 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, store: Stor
         const dir = query.get('direction') ?? 'desc';
         list.sort((a, b) => (sort === 'created' ? (a.number - b.number) : (a.number - b.number)) * (dir === 'asc' ? 1 : -1));
         const { page, link } = paginate(list, query, absUrl(req, pathname));
-        sendRawJson(res, 200, `[${page.map((i) => issueJson(repo, i)).join(',')}]`, { Link: link });
+        const items = page.map((i) => issueJson(repo, i));
+        sendRawJson(res, 200, `[${items.join(',')}]`, { Link: link }, 2 + page.reduce((a, it) => a + it._jsonLen, 0) + Math.max(0, items.length - 1));
         return;
       }
       const num = Number(tail[1]);
       const issue = repo.issues.get(num);
       if (tail.length === 2) {
         if (!issue) { notFound(res); return; }
-        if (method === 'GET') { sendRawJson(res, 200, issueJson(repo, issue)); return; }
+        if (method === 'GET') { const j = issueJson(repo, issue); sendRawJson(res, 200, j, undefined, issue._jsonLen); return; }
         if (method === 'PATCH') {
           const b = await readBodyJson();
           if (!b.ok) { badRequest(res, b.error); return; }
@@ -667,7 +692,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, store: Stor
           if (typeof b.value.body === 'string') issue.body = b.value.body;
           issue.updated_at = isoOf(nextTs());
           issue._json = null;
-          sendRawJson(res, 200, issueJson(repo, issue));
+          const j = issueJson(repo, issue);
+          sendRawJson(res, 200, j, undefined, issue._jsonLen);
           return;
         }
       }
@@ -1032,8 +1058,7 @@ export function createApp(): Server {
   const store = new Store();
 
   return createServer((req: IncomingMessage, res: ServerResponse): void => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const pathname = url.pathname;
+    const { pathname, query } = parseQuery(req);
     const method = req.method ?? 'GET';
     try {
       if (pathname === '/healthz') {
@@ -1047,7 +1072,7 @@ export function createApp(): Server {
         if (!repo) { notFound(res); return; }
         const what = gitMatch[3];
         if (what === 'info/refs') {
-          const service = url.searchParams.get('service') ?? '';
+          const service = query.get('service') ?? '';
           if (service === 'git-upload-pack' || service === 'git-receive-pack') {
             handleInfoRefs(req, res, store, repo, service);
             return;
