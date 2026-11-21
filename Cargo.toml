@@ -1,0 +1,15 @@
+[package]
+name = "forge"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+sha1 = "0.10"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
