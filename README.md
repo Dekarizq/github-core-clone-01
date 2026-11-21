@@ -1,6 +1,8 @@
 # github-core-clone-01 — a GitHub-compatible git forge (Rust)
 
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Dekarizq/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Dekarizq/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01)
 
 A single-process, std-only Rust implementation of a GitHub-compatible
 git forge: git smart HTTP (protocol v2 + v0), REST v3, GraphQL v4 and MCP
